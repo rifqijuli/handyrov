@@ -1,0 +1,119 @@
+import main_vision as vision
+import main_control as control
+import main_state as state
+import main_cleaner as cleaner
+import main_rc_command as rc_command
+import main_sonar as sonar
+import second_vision as crane_view
+import multiprocessing as mp
+import time
+import logging
+from misc import stateLoader as stateLoad
+from misc import heading_difference_loader as heading_difference_loader
+
+log = logging.getLogger("runner")
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+log.info("Runner started")
+
+class Process(mp.Process):
+    def __init__(
+            self, 
+            id, 
+            flag, 
+            camera_opt=None, 
+            model_opt=None, 
+            rc_pwm=None, 
+            is_program_state_busy=None, 
+            ping_distance=None, 
+            is_target_close=None, 
+            is_target_detected=None,
+            target_class=None,
+            target_id=None,
+            is_crane_view=None,
+            crane_view_horizontal=None,
+            crane_view_vertical=None
+            ):
+        
+        super(Process, self).__init__()
+        self.id = id
+        self.flag = flag
+        self.camera_opt = camera_opt
+        self.model_opt = model_opt or {}
+        self.rc_pwm = rc_pwm
+        self.is_program_state_busy = is_program_state_busy
+        self.ping_distance = ping_distance
+        self.is_target_close = is_target_close
+        self.is_target_detected = is_target_detected
+        self.target_class = target_class
+        self.target_id = target_id
+        self.is_crane_view = is_crane_view
+        self.crane_view_horizontal = crane_view_horizontal
+        self.crane_view_vertical = crane_view_vertical
+
+    def run(self):
+        time.sleep(1)
+        match self.flag:
+            case "image":
+                log.info("I'm the process with id: {}".format(self.id))
+                vision.image_main(
+                    cameraOpt=self.camera_opt, 
+                    modelOpt=self.model_opt,
+                    rc_pwm=self.rc_pwm, 
+                    is_program_state_busy=self.is_program_state_busy,
+                    ping_distance=self.ping_distance,
+                    is_target_close=self.is_target_close,
+                    is_target_detected=self.is_target_detected,
+                    target_class=self.target_class,
+                    target_id=self.target_id,
+                    is_crane_view=self.is_crane_view,
+                    crane_view_horizontal=self.crane_view_horizontal,
+                    crane_view_vertical=self.crane_view_vertical
+                    )
+            case "control":
+                log.info("I'm the process with id: {}".format(self.id))
+                control.main_control(
+                    rc_pwm=self.rc_pwm, 
+                    is_program_state_busy=self.is_program_state_busy,
+                    ping_distance=self.ping_distance,
+                    is_target_close=self.is_target_close,
+                    is_target_detected=self.is_target_detected,
+                    is_crane_view=self.is_crane_view
+                    )
+            case "cleaner":
+                log.info("I'm the process with id: {}".format(self.id))
+                cleaner.main_cleaner()
+            case "rc_command":
+                log.info("I'm the process with id: {}".format(self.id))
+                rc_command.main_rc_command(rc_pwm=self.rc_pwm, 
+                                           is_program_state_busy=self.is_program_state_busy,
+                                           ping_distance=self.ping_distance,
+                                           is_target_close=self.is_target_close)
+            case "ping_sonar":
+                log.info("I'm the process with id: {}".format(self.id))
+                sonar.main_sonar(ping_distance=self.ping_distance)
+            case "crane_view":
+                log.info("I'm the process with id: {}".format(self.id))
+                crane_view.image_main(
+                    modelOpt=self.model_opt,
+                    is_program_state_busy=self.is_program_state_busy,
+                    is_target_detected=self.is_target_detected,
+                    target_class=self.target_class,
+                    target_id=self.target_id,
+                    is_crane_view=self.is_crane_view,
+                    crane_view_horizontal=self.crane_view_horizontal,
+                    crane_view_vertical=self.crane_view_vertical
+                    )
+            case "dummy":
+                log.info("I'm the process with id: {}".format(self.id))
+                while True:
+                    time.sleep(0.5)
+                    log.info(f"Perbedaan jadi sekian : {state.horizontalHeadingDifference.get_value('pixel')}")
+                    log.info(f"Harusnya Sibuk (True) : {state.program_state.get_busy_state()}")
+                    time.sleep(5)
+                    state.program_state.set_state_to_free()
+                    state.program_state.set_yaw_state_to_free()
+                    state.program_state.set_pitch_state_to_free()
+                    log.info(f"Harusnya Free (False) : {state.program_state.get_busy_state()}")
+

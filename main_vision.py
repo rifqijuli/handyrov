@@ -1,0 +1,385 @@
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+import numpy as np
+import cv2
+import gi
+from camera import rov_camera
+from ultralytics import YOLO
+import string
+from tracking import yolo_track, pixel_convert
+from collections import defaultdict
+from image_enhancement import funie
+import main_state as runner
+import logging
+from misc import stateLoader as stateLoad
+from misc import specLoader as spec
+from object.select_object import click_mouse_position
+from object_detection_model.model_loader import get_model_path
+from log.object_detection_logger import object_logger
+import time
+
+specs = spec.load_specs()
+tracks_file = open('live_pool_tracks.txt', 'w')  # MOT format
+
+log = logging.getLogger("Main Vision")
+log.info("Main Vision started")
+
+from image_enhancement.nets.funiegan import GeneratorFunieGAN as Generator  # adjust import path to match your repo
+
+#!/usr/bin/env python
+
+#if __name__ == '__main__':
+def image_main(
+        cameraOpt = False, 
+        modelOpt = False, 
+        rc_pwm = None, 
+        is_program_state_busy = None, 
+        ping_distance = None, 
+        is_target_close = None, 
+        is_target_detected = None,
+        target_class = None,
+        target_id = None,
+        is_crane_view = None,
+        crane_view_horizontal = None,
+        crane_view_vertical = None):
+    """
+    BlueRov video capture class
+    """
+    frame_id = 0
+    confidence_threshold = 0.2
+    iou_threshold = 0.6
+     
+    obj_logger = object_logger("detection_log.csv")
+
+    model = YOLO(get_model_path(modelOpt))
+    log.info(f"Model {modelOpt['which_model']} on dataset {modelOpt['dataset']} loaded successfully")
+
+    # FUnIE-GAN
+    # --- Load pretrained FUnIE-GAN model ---
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_path = "image_enhancement/funie_generator.pth"  # change if different
+    G = Generator().to(device)
+    G.load_state_dict(torch.load(model_path, map_location=device))
+    G.eval()
+
+    # --- Define transforms ---
+    to_tensor = T.Compose([
+        T.ToPILImage(),
+        T.Resize((256, 256)),
+        T.ToTensor()
+    ])
+    #OR.. Still cant remove this funie gan to other files
+    #img_enhance = funie.funie()
+
+    # mouse callback function
+    def get_click(event,x,y,flags,param):
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            print(f"Clicked coordinates: X={x}, Y={y}")
+            click_mouse_position.set_position(x, y)
+
+    #ROI image
+    class roi_image:
+        def __init__(self, x, y, width, height):
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+
+    # Target frame size
+    class frameSize:
+        def __init__(self, width, height):
+            self.width = width
+            self.height = height
+        
+        def center(self):
+            return (self.width/2, self.height/2)
+
+    # State management
+    class State:
+        def __init__(self):
+            self.roi_selected = False
+            self.object_selected = False
+        
+        def toggle_roi(self):
+            self.roi_selected = not self.roi_selected
+        
+        def toggle_object(self):
+            self.object_selected = not self.object_selected
+
+    #Target object
+    class target_object:
+        target_status = False
+        target_id = -1
+        target_class = -1
+
+        def set_target(selected_id, selected_class):
+            target_object.target_id = selected_id
+            target_object.target_class = selected_class
+            target_class.value = selected_class
+            target_id.value = selected_id
+
+        def toggle_target():
+            target_object.target_status = not target_object.target_status
+
+
+    def handle_object_click(object):
+        """Handles all the state changes after a click — call this separately."""
+        if click_mouse_position.is_within_object(object):
+            target_object.set_target(object['track_id'], object['obj_class'])
+
+            if target_object.target_status is False:
+                target_object.toggle_target()
+
+            if system_state.roi_selected is True:
+                system_state.toggle_roi()
+                runner.isObjectSelected.set_state(True)
+
+            return object['track_id']
+        return False
+
+    log.info('Initialising stream...')
+    log.info('Press q to quit')
+    log.info('Press s to select ROI')
+    log.info('Press e to remove ROI')
+    waited = 0
+    system_state = State()
+
+     # Create the video object
+    if cameraOpt == 'bluerov':
+        video = rov_camera.Video(port=spec.get_camera_dwe_port(specs))
+        # Add port= if is necessary to use a different one
+        while not video.frame_available():
+            waited += 1
+            print('\r  Frame not available (x{})'.format(waited), end='')
+            cv2.waitKey(30)
+        log.info('\nSuccess!\nStarting streaming - press "q" to quit.')
+    else:
+        video = cv2.VideoCapture(-1)
+
+    # YOLO Store the track history
+    track_history = defaultdict(lambda: []) 
+
+    # Initiate resize frame size
+    targetFrame = frameSize(*spec.get_vision_resolution(specs))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter("output.mp4", fourcc, 30, (targetFrame.width, targetFrame.height))
+
+    while True:
+        time_to_log = time.time()
+        time_to_track = 0
+        #rc_pwm[9] = int(1612) # Set camera face downward
+        is_main_state_busy = runner.program_state.get_busy_state()
+        is_yaw_state_busy = runner.program_state.get_yaw_busy_state()
+        is_pitch_state_busy = runner.program_state.get_pitch_busy_state()
+        if cameraOpt == 'bluerov':
+            if video.frame_available():
+                # Only retrieve and display a frame if it's new
+                frame = video.frame()
+            frame = cv2.resize(frame, (targetFrame.width, targetFrame.height))
+        else:
+            ret, frame = video.read()
+            if not ret:
+                log.info("Can't receive frame (stream end?). Exiting ...")
+                break
+            frame = cv2.resize(frame, (targetFrame.width, 960))
+            frame = frame[120:840,:] # Crop to 720p
+            frame = cv2.flip(frame, 1)  # Flip frame horizontally for correct orientation
+        # Wait for the next frame to become available
+        
+        frame = cv2.resize(frame, (targetFrame.width, targetFrame.height))
+
+        try: #If ROI selected
+            if target_object.target_status is True:
+                # When Object is Selected
+                # if (runner.program_state.get_state() == 'FREE'): <-- If you want to set only when FREE
+                time_to_track = time.time() * 1000
+                results = model.track(frame, persist=True,conf=confidence_threshold, iou=iou_threshold, classes=target_object.target_class)
+                log.info(f"Tracking target ID: {results[0].boxes.cls} with class {target_object.target_class}")
+                if results[0].boxes is not None and len(results[0].boxes) > 0:
+                    log.info("Set detection to 1")
+                    is_target_detected.value = 1
+                else:
+                    log.info("Set detection to 2 (In the loop, but no object detected)")
+                    is_target_detected.value = 2
+                annotated_frame = results[0].plot()
+                track_objects = yolo_track.draw_tracker(results[0], track_history, frame, target_id=target_object.target_id, tracks_file=tracks_file, frame_id=frame_id) 
+                frame = track_objects[0]['frame']
+                time_to_track = (time.time() - time_to_track) * 1000
+
+                # Set Heading Difference to runner
+                horizontal_diff = track_objects[0]['detected_object']['x_diff']
+                vertical_diff = track_objects[0]['detected_object']['y_diff']
+
+                p1 = np.array((0, 0))
+                p2 = np.array((horizontal_diff, vertical_diff))
+
+                distance = np.linalg.norm(p2 - p1)
+                log.info(f"Distance to target: {distance} pixels")
+                log.info(f"object width: {track_objects[0]['detected_object']['width']} pixels, object height: {track_objects[0]['detected_object']['height']} pixels")
+                
+                approx_filled_area = pixel_convert.pixel_filled(track_objects[0]['detected_object']['width'], track_objects[0]['detected_object']['height'])
+                log.info(f"Approximate filled area: {approx_filled_area * 100} % of the frame")
+                #runner.filledAreaDifference.set_value(approx_filled_area)
+                
+                if (approx_filled_area * 100) >= 0.5:
+                    log.info("Target is close based on filled area. Setting is_target_close to True.")
+                    is_target_close.value = 1
+                else:
+                    log.info("Target is not close based on filled area. Setting is_target_close to False.")
+                    is_target_close.value = 0
+                
+                if abs(distance) >= spec.get_tolerance_pixels(specs):
+                    log.info("Target is far based on pixel distance. Setting program state to Busy.")
+                    #if is_main_state_busy == False: # Is Free
+                    if is_program_state_busy.value == 0: # Is Free
+                        #runner.program_state.set_state_to_busy()
+                        log.info("Setting program state to Busy.")
+                        if is_crane_view.value == 0: # If not in crane view, use normal vertical difference
+                            is_program_state_busy.value = 1 # Set to Busy
+                            if abs(horizontal_diff) >= spec.get_tolerance_pixels(specs):
+                                runner.horizontalHeadingDifference.set_pixel_value(horizontal_diff)
+                            else:
+                                runner.horizontalHeadingDifference.set_pixel_value(horizontal_diff)
+                                log.info("Yaw position accepted")
+                            if abs(vertical_diff) >= spec.get_tolerance_pixels(specs):
+                                runner.verticalHeadingDifference.set_pixel_value(vertical_diff)
+                            else:
+                                runner.verticalHeadingDifference.set_pixel_value(vertical_diff)
+                            log.info("Pitch position accepted")
+                        else: # If in crane view, use closeness value for vertical difference. Let second vision set closeness value.
+                            is_program_state_busy.value = 1 # Set to Busy
+                            if abs(crane_view_horizontal.value) >= spec.get_tolerance_pixels(specs):
+                                runner.horizontalHeadingDifference.set_pixel_value(crane_view_horizontal.value)
+                            else:
+                                runner.horizontalHeadingDifference.set_pixel_value(crane_view_horizontal.value)
+                                log.info("Yaw position accepted")
+                            if abs(vertical_diff) >= spec.get_tolerance_pixels(specs):
+                                runner.verticalHeadingDifference.set_pixel_value(vertical_diff)
+                            else:
+                                runner.verticalHeadingDifference.set_pixel_value(vertical_diff)
+                            log.info("Pitch position accepted")
+                else: # SET HERE TO READY FOR DISTANCE MEASUREMENT
+                    log.info("All Position accepted")
+                    runner.horizontalHeadingDifference.set_pixel_value(horizontal_diff)
+                    runner.verticalHeadingDifference.set_pixel_value(vertical_diff)
+
+                    # Only set to free when target is already near. Never set to free when still far, because attitude will always need correction and maintained.
+                    # runner.program_state.set_state_to_free()
+
+                    # Just so that the program will always busy. Should be changed to distance in here.
+                    # If this is not here, then the state will never be set to busy because the main state is only set to busy when the target is far, and if the target is near, the state will never be set to free, so it will be stuck in free state.
+                    #runner.program_state.set_state_to_busy()
+                    is_program_state_busy.value = 1 # Set to Busy
+
+            if system_state.roi_selected:
+                rect_img = frame[int(roi_obj.y):int(roi_obj.y+roi_obj.height), int(roi_obj.x):int(roi_obj.x+roi_obj.width)]
+                # Do process to the selected image here
+                # Convert frame (BGR->RGB)
+                rgb = cv2.cvtColor(rect_img, cv2.COLOR_BGR2RGB)
+                inp = to_tensor(rgb).unsqueeze(0).to(device)
+                
+                # Run enhancement
+                with torch.no_grad():
+                    out = G(inp)
+                
+                # Convert back to OpenCV format
+                out_np = out.squeeze(0).cpu().permute(1, 2, 0).numpy()
+                out_np = np.clip(out_np * 255, 0, 255).astype(np.uint8)
+                out_bgr = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+                out_bgr = cv2.resize(out_bgr, (int(roi_obj.width), int(roi_obj.height)))
+                
+                # Change out_bgr to frame if want to track with normal video feed
+                try:
+                    results = model.track(rect_img, persist=True,conf=confidence_threshold, iou=iou_threshold)
+                    #results = model.track(out_bgr, persist=True,conf=confidence_threshold, iou=iou_threshold) #Funie GAN
+                    #results = model.track(source="https://youtu.be/LNwODJXcvt4", conf=0.3, iou=0.5, show=True)
+                    annotated_frame = results[0].plot()
+                    #annotated_frame_2 = results_2[0].plot()
+                    track_objects = yolo_track.draw_tracker(results[0], track_history, frame, roi_obj)
+
+                except Exception as e:
+                    log.info(f"No object detection in the frame")
+                    annotated_frame_original = rect_img
+                    #annotated_frame = out_bgr # Change to rect_img if want to track with normal video feed
+                
+                #Put it back to frame
+                frame[int(roi_obj.y):int(roi_obj.y+roi_obj.height), int(roi_obj.x):int(roi_obj.x+roi_obj.width)] = annotated_frame
+                cv2.rectangle(frame, 
+                    (int(roi_obj.x), int(roi_obj.y)), 
+                    (int(roi_obj.x + roi_obj.width), int(roi_obj.y + roi_obj.height)),
+                    (0, 255, 255), 2)
+                
+                #cv2.imshow('rect_img', annotated_frame_2)
+                #cv2.imshow('resct_img', track_objects[0]['frame'])
+        except:
+            pass
+        finally:
+            # Log Process
+            loop_ms = (time.time() - time_to_log) * 1000
+            obj_logger.log(
+                timestamp = time_to_log,
+                frame_id = frame_id, 
+                loop_ms = loop_ms, 
+                fps = 1000 / loop_ms if loop_ms > 0 else 0, 
+                tracking_ms = time_to_track
+            )
+
+            # Tracker
+            if target_object.target_status is True:
+                frame_id += 1
+            # Show both
+            #out.write(frame)
+            cv2.namedWindow('Original')
+            cv2.circle(frame, center=(int(targetFrame.center()[0]), int(targetFrame.center()[1])), radius=5, color=(0, 255, 255), thickness=-1)
+            cv2.imshow("Original", frame)
+            if system_state.roi_selected:
+                cv2.setMouseCallback('Original', get_click)
+                try:
+                    for each in track_objects:
+                        if target_object.target_status is False:
+                            isInObject = click_mouse_position.is_within_object(each['detected_object'])
+                            if isInObject:
+                                handle_object_click(each['detected_object'])
+                            #log.info(f"Is within object: {isInObject}")
+                except:
+                    log.info("No object")
+            click_mouse_position.reset()
+
+
+            # Allow frame to display, and check if user wants to quit
+            key = cv2.waitKey(50)
+            if key == ord('q'):
+                #runner.program_state.set_state_to_free()
+                is_program_state_busy.value = 0 # Set to Free
+                is_target_detected.value = 0 # Set to Not Detected
+                #out.release()
+                break
+            elif key == ord('s'):
+                #Send back state to runner
+                runner.isObjectSelected.set_state(False)
+
+                if target_object.target_status is True:
+                    target_object.toggle_target()
+                
+                is_target_detected.value = 0 # Set to Not Detected
+
+                showCrosshair = False
+                fromCenter = False
+                selected_roi = cv2.selectROI("Select ROI", frame, fromCenter, showCrosshair)
+                roi_obj = roi_image(selected_roi[0],selected_roi[1],selected_roi[2],selected_roi[3])
+                if system_state.roi_selected is not True:
+                    system_state.toggle_roi()
+                cv2.destroyWindow("Select ROI")
+            elif key == ord('e'):
+                if system_state.roi_selected is True:
+                    #Send back state to runner
+                    runner.isObjectSelected.set_state(False)
+
+                    system_state.toggle_roi()
+                cv2.destroyAllWindows()
+            elif key == ord('n'):
+                # Manual change to near camera setup
+                pass
+    cv2.destroyAllWindows()
