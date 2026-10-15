@@ -74,9 +74,10 @@ def pid_metrics(filepath, label):
     ax2.legend()
 
     plt.tight_layout()
-    plt.savefig(f"pid_{label.replace('=','').replace(' ','_')}.png", dpi=150)
+    filename = f"pid_{label.replace('=','').replace(' ','_').replace('|','-')}.png"
+    plt.savefig(filename, dpi=150)
     plt.close()
-    print(f"  Plot saved: pid_{label}.png")
+    print(f"  Plot saved: {filename}")
 
 
 
